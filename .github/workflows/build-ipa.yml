@@ -81,7 +81,6 @@ jobs:
       - name: Install CocoaPods dependencies
         run: |
           set -euo pipefail
-          export EXPO_USE_PRECOMPILED_MODULES=0
           cd ios
           pod install --repo-update
 
@@ -99,6 +98,15 @@ jobs:
           echo "Scheme: $SCHEME"
           echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
 
+      - name: Resolve Swift Package dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/SourcePackagesCache"
+          xcodebuild -resolvePackageDependencies \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -clonedSourcePackagesDirPath "$HOME/SourcePackagesCache"
+
       - name: Build app without Apple signing
         run: |
           set -euo pipefail
@@ -110,6 +118,7 @@ jobs:
             -sdk iphoneos \
             -configuration Release \
             -derivedDataPath build \
+            -clonedSourcePackagesDirPath "$HOME/SourcePackagesCache" \
             -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -120,7 +129,7 @@ jobs:
 
           echo "xcodebuild exit code: $BUILD_STATUS"
           echo "---- Compiler errors and warnings ----"
-          grep -E "error:|warning:|fatal error:|BUILD FAILED|\*\* BUILD" xcodebuild.log || true
+          grep -E -A 5 "error:|warning:|fatal error:|BUILD FAILED|\*\* BUILD" xcodebuild.log || true
           echo "---- Last 120 log lines ----"
           tail -n 120 xcodebuild.log
           test "$BUILD_STATUS" -eq 0
