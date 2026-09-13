@@ -1,0 +1,153 @@
+name: Build Bat App IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Compile unsigned IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Verify checked out repository
+        run: |
+          set -euo pipefail
+          git status --short
+          git rev-parse --show-toplevel
+          git rev-parse HEAD
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify project files
+        run: |
+          set -euo pipefail
+          required_files=(
+            "app.json"
+            "App.tsx"
+            "index.ts"
+            "package.json"
+          )
+          for file in "${required_files[@]}"; do
+            if [ ! -s "$file" ]; then
+              echo "ERRO: arquivo ausente ou vazio: $file"
+              exit 1
+            fi
+            echo "OK: $file"
+          done
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Ensure iOS bundle identifier is set
+        run: |
+          set -euo pipefail
+          node -e "
+            const fs = require('fs');
+            const path = 'app.json';
+            const json = JSON.parse(fs.readFileSync(path, 'utf8'));
+            json.expo.ios = json.expo.ios || {};
+            if (!json.expo.ios.bundleIdentifier) {
+              json.expo.ios.bundleIdentifier = 'com.batapp.app';
+              fs.writeFileSync(path, JSON.stringify(json, null, 2) + '\n');
+              console.log('bundleIdentifier ausente: definido com.batapp.app (ajuste em app.json se quiser outro).');
+            } else {
+              console.log('bundleIdentifier ja definido: ' + json.expo.ios.bundleIdentifier);
+            }
+          "
+
+      - name: Generate native iOS project (expo prebuild)
+        run: |
+          set -euo pipefail
+          npx expo prebuild --platform ios --no-install --clean
+
+      - name: Install CocoaPods dependencies
+        run: |
+          set -euo pipefail
+          cd ios
+          pod install --repo-update
+
+      - name: Verify native project files
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(find ios -maxdepth 1 -name '*.xcworkspace' -print -quit)"
+          if [ -z "$WORKSPACE" ]; then
+            echo "ERRO: nenhum .xcworkspace encontrado em ios/ apos o prebuild"
+            exit 1
+          fi
+          echo "Workspace encontrado: $WORKSPACE"
+          echo "WORKSPACE=$WORKSPACE" >> "$GITHUB_ENV"
+          SCHEME="$(basename "$WORKSPACE" .xcworkspace)"
+          echo "Scheme: $SCHEME"
+          echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
+
+      - name: Build app without Apple signing
+        run: |
+          set -euo pipefail
+          rm -rf build Payload BatApp.ipa
+          set +e
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            clean build 2>&1 | tee xcodebuild.log
+          BUILD_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          echo "xcodebuild exit code: $BUILD_STATUS"
+          echo "---- Compiler errors and warnings ----"
+          grep -E "error:|warning:|fatal error:|BUILD FAILED|\*\* BUILD" xcodebuild.log || true
+          echo "---- Last 120 log lines ----"
+          tail -n 120 xcodebuild.log
+          test "$BUILD_STATUS" -eq 0
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BatApp-build-log
+          path: |
+            xcodebuild.log
+            build/Logs/
+          if-no-files-found: ignore
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find build/Build/Products -type d -name '*.app' -print -quit)"
+          test -n "$APP_PATH"
+          echo "App encontrado: $APP_PATH"
+          mkdir -p Payload
+          cp -R "$APP_PATH" "Payload/$(basename "$APP_PATH")"
+          ditto -c -k --sequesterRsrc --keepParent Payload BatApp.ipa
+          unzip -l BatApp.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BatApp-IPA
+          path: BatApp.ipa
+          if-no-files-found: error
+          retention-days: 14
